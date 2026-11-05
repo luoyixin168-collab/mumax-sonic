@@ -55,7 +55,7 @@ def audio_status(diagnostic):
     """Keep operational status legible; full implementation diagnostics export separately."""
     state = diagnostic.get("state", "unknown")
     if diagnostic.get("last_error"):
-        return f"音频 {state} · {diagnostic['last_error']} · 可点击重连"
+        return f"音频 {state} · {diagnostic['last_error']} · 可点击“开启声音”重试"
     hrtf = diagnostic.get("hrtf_status", "unknown")
     spatial = "HRTF 已启用" if hrtf in {"enabled", "required", "headphones_detected"} else f"HRTF 未启用 ({hrtf}) · 当前不作空间验收"
     quality = diagnostic.get("data_state", "")
@@ -104,6 +104,7 @@ class SonicApp:
         self._labels.update({v: k for k, v in FIELD_SCENARIOS.items()})
         self.field_view = None
         self.replay = None
+        self.replay_path = None
         self._field_cache = None
         self._field_key = None
         self.max_dt_s = None
@@ -128,7 +129,11 @@ class SonicApp:
         self.static = tk.BooleanVar(value=True)
         self.hrtf = tk.BooleanVar(value=True)
         self.device = tk.StringVar(value="系统默认设备")
-        self.status = tk.StringVar(value="无声预览" if no_audio else "尚未开启音频 · 点击“开始试听”")
+        self.status = tk.StringVar(value="无声预览" if no_audio else "声音尚未开启 · 点击“开启声音”")
+        self.task_status = tk.StringVar(value="当前任务：示例")
+        self.data_state = tk.StringVar(value="数据：等待更新")
+        self.audio_state = tk.StringVar(value="音频：无声预览" if no_audio else "音频：未开启")
+        self.advanced_visible = tk.BooleanVar(value=False)
         self.time_label = tk.StringVar()
         self.summary = tk.StringVar()
         self.subtitle = tk.StringVar(value='P1 合成声源 / P2a 三分量场观察')
@@ -143,8 +148,8 @@ class SonicApp:
         # Keep the full control panel visible even with Windows desktop scaling.
         w.tk.call("tk", "scaling", 96 / 72)
         w.title("MuMax-Sonic · 场观察与空间听觉")
-        w.geometry("1120x1000")
-        w.minsize(1050, 980)
+        w.geometry("1180x900")
+        w.minsize(960, 700)
         w.configure(bg=BG)
         style = ttk.Style(w)
         style.theme_use("clam")
@@ -152,70 +157,109 @@ class SonicApp:
         style.configure("TLabel", background=BG, foreground=TEXT, font=("Microsoft YaHei UI", 10))
         style.configure("Muted.TLabel", foreground=MUTED)
         style.configure("Title.TLabel", font=("Microsoft YaHei UI", 21, "bold"))
+        style.configure("Status.TLabel", font=("Microsoft YaHei UI", 10, "bold"))
         style.configure("TButton", padding=(12, 7), font=("Microsoft YaHei UI", 10))
         style.configure("TCheckbutton", background=BG, foreground=TEXT, font=("Microsoft YaHei UI", 10))
         style.map("TCheckbutton", background=[("active", PANEL)], foreground=[("active", TEXT)])
         style.configure("TRadiobutton", background=BG, foreground=TEXT)
         style.map("TRadiobutton", background=[("active", PANEL)], foreground=[("active", TEXT)])
         style.configure("Horizontal.TScale", background=BG)
-        style.configure("Treeview", background=PANEL, fieldbackground=PANEL, foreground=TEXT, rowheight=27)
+        style.configure("Treeview", background=PANEL, fieldbackground=PANEL, foreground=TEXT, rowheight=25)
         style.configure("Treeview.Heading", font=("Microsoft YaHei UI", 9, "bold"))
-        shell = ttk.Frame(w, padding=18)
+
+        shell = ttk.Frame(w, padding=14)
         shell.pack(fill="both", expand=True)
         ttk.Label(shell, text="MuMax-Sonic", style="Title.TLabel").pack(anchor="w")
         ttk.Label(shell, textvariable=self.subtitle, style="Muted.TLabel").pack(anchor="w", pady=(2, 8))
-        toolbar = ttk.Frame(shell)
-        toolbar.pack(fill="x", pady=(0, 8))
-        ttk.Label(toolbar, text="场景").pack(side="left", padx=(0, 8))
-        combo = ttk.Combobox(toolbar, textvariable=self.scenario, values=list(self._labels), state="readonly", width=24)
+
+        entries = ttk.Frame(shell)
+        entries.pack(fill="x", pady=(0, 8))
+        self.attach_entry = ttk.Button(entries, text="接入正在运行的仿真", command=lambda: self.open_attachment())
+        self.attach_entry.pack(side="left")
+        self.replay_entry = ttk.Button(entries, text="打开回放", command=lambda: self.load_field())
+        self.replay_entry.pack(side="left", padx=8)
+        self.demo_entry = ttk.Button(entries, text="试用示例", command=self.try_demo)
+        self.demo_entry.pack(side="left")
+        ttk.Label(entries, text="三个入口均不会自动开启声音", style="Muted.TLabel").pack(side="left", padx=14)
+
+        status_row = ttk.Frame(shell)
+        status_row.pack(fill="x", pady=(0, 8))
+        ttk.Label(status_row, textvariable=self.task_status, style="Status.TLabel", wraplength=410).pack(side="left")
+        ttk.Label(status_row, textvariable=self.data_state, style="Status.TLabel").pack(side="left", padx=18)
+        ttk.Label(status_row, textvariable=self.audio_state, style="Status.TLabel").pack(side="left", padx=(0, 12))
+        self.audio_button = ttk.Button(status_row, text="开启声音", command=self.toggle_audio)
+        self.audio_button.pack(side="right")
+
+        mode_row = ttk.Frame(shell)
+        mode_row.pack(fill="x", pady=(0, 5))
+        ttk.Label(mode_row, text="场景").pack(side="left", padx=(0, 8))
+        combo = ttk.Combobox(mode_row, textvariable=self.scenario, values=list(self._labels), state="readonly", width=24)
         combo.pack(side="left")
         self.scenario_combo = combo
         combo.bind("<<ComboboxSelected>>", lambda e: self.reset())
-        self.play_button = ttk.Button(toolbar, text="播放", command=self.toggle_play)
-        self.play_button.pack(side="left", padx=8)
-        ttk.Button(toolbar, text="重置", command=self.reset).pack(side="left")
-        ttk.Checkbutton(toolbar, text="暂停时探听静态", variable=self.static).pack(side="left", padx=14)
-        ttk.Label(toolbar, textvariable=self.time_label, style="Muted.TLabel").pack(side="right")
-        timeline = ttk.Frame(shell)
-        timeline.pack(fill='x', pady=(0, 4))
-        ttk.Label(timeline, text='回放配方').pack(side='left')
-        recipe_box = ttk.Combobox(timeline, textvariable=self.replay_recipe, values=['拓扑', '活动', '频带'], state='readonly', width=6)
-        recipe_box.pack(side='left', padx=5)
-        recipe_box.bind('<<ComboboxSelected>>', lambda e: self.invalidate_field())
-        ttk.Label(timeline, text='倍速').pack(side='left')
-        speed_box = ttk.Combobox(timeline, textvariable=self.speed, values=['0.25', '0.5', '1', '2', '4'], state='readonly', width=5)
+        self.recipe_label = ttk.Label(mode_row, text="观察模式")
+        self.recipe_box = ttk.Combobox(mode_row, textvariable=self.replay_recipe,
+            values=['拓扑', '活动', '频带'], state='readonly', width=6)
+        self.recipe_box.bind('<<ComboboxSelected>>', self.change_recipe)
+        self.time_label_widget = ttk.Label(mode_row, textvariable=self.time_label, style="Muted.TLabel")
+        self.time_label_widget.pack(side="right")
+
+        self.control_deck = ttk.Frame(shell)
+        self.control_deck.pack(fill='x')
+        self.playback_controls = ttk.Frame(self.control_deck)
+        ttk.Button(self.playback_controls, text="播放", command=self.toggle_play).pack(side="left")
+        self.play_button = self.playback_controls.winfo_children()[-1]
+        ttk.Button(self.playback_controls, text="重置", command=self.reset).pack(side="left", padx=6)
+        ttk.Checkbutton(self.playback_controls, text="暂停时探听静态", variable=self.static).pack(side="left", padx=(4, 12))
+        ttk.Label(self.playback_controls, text='倍速').pack(side='left')
+        speed_box = ttk.Combobox(self.playback_controls, textvariable=self.speed,
+            values=['0.25', '0.5', '1', '2', '4'], state='readonly', width=5)
         speed_box.pack(side='left', padx=5)
         speed_box.bind('<<ComboboxSelected>>', self.change_speed)
-        ttk.Label(timeline, text='跳转/ns').pack(side='left')
-        ttk.Entry(timeline, textvariable=self.seek_ns, width=9).pack(side='left', padx=5)
-        ttk.Button(timeline, text='跳转', command=self.seek_to_entry).pack(side='left')
-        ttk.Button(timeline, text='上一帧', command=lambda: self.step_frame(-1)).pack(side='left', padx=4)
-        ttk.Button(timeline, text='下一帧', command=lambda: self.step_frame(1)).pack(side='left')
-        ttk.Label(timeline, text='最大间隔/ns').pack(side='left', padx=(8, 3))
-        ttk.Entry(timeline, textvariable=self.max_dt_ns, width=7).pack(side='left')
-        ttk.Button(timeline, text='应用', command=self.apply_max_dt).pack(side='left', padx=4)
-        band_row = ttk.Frame(shell)
-        band_row.pack(fill='x', pady=(0, 4))
-        for label, variable, width in [('频带下限/GHz', self.band_low, 6), ('上限/GHz', self.band_high, 6), ('窗口/帧', self.band_window, 6), ('参考轴 XYZ', self.band_axis, 12)]:
-            ttk.Label(band_row, text=label).pack(side='left', padx=(0, 4))
-            ttk.Entry(band_row, textvariable=variable, width=width).pack(side='left', padx=(0, 8))
-        ttk.Button(band_row, text='应用频带', command=self.apply_band).pack(side='left')
-        ttk.Label(band_row, text='声源上限 / 分摊音量').pack(side='left', padx=(16, 4))
-        ttk.Combobox(band_row, textvariable=self.source_budget, values=list(range(1, MAX_SOURCE_BUDGET+1)), state='readonly', width=4).pack(side='left')
-        ttk.Label(band_row, text='空间聚合').pack(side='left', padx=(12, 4))
-        ttk.Combobox(band_row, textvariable=self.aggregation_mode, values=['fixed', 'adaptive'], state='readonly', width=9).pack(side='left')
-        ttk.Label(shell, textvariable=self.data_note, style='Muted.TLabel', wraplength=1040).pack(anchor='w', pady=(0, 5))
+        ttk.Label(self.playback_controls, text='跳转/ns').pack(side='left')
+        ttk.Entry(self.playback_controls, textvariable=self.seek_ns, width=9).pack(side='left', padx=5)
+        ttk.Button(self.playback_controls, text='跳转', command=self.seek_to_entry).pack(side='left')
+        ttk.Button(self.playback_controls, text='上一帧', command=lambda: self.step_frame(-1)).pack(side='left', padx=4)
+        ttk.Button(self.playback_controls, text='下一帧', command=lambda: self.step_frame(1)).pack(side='left')
+
+        self.band_controls = ttk.Frame(self.control_deck)
+        for label, variable, width in [('频带下限/GHz', self.band_low, 6), ('上限/GHz', self.band_high, 6),
+                                       ('窗口/帧', self.band_window, 6), ('参考轴 XYZ', self.band_axis, 12)]:
+            ttk.Label(self.band_controls, text=label).pack(side='left', padx=(0, 4))
+            ttk.Entry(self.band_controls, textvariable=variable, width=width).pack(side='left', padx=(0, 8))
+        ttk.Button(self.band_controls, text='应用频带', command=self.apply_band).pack(side='left')
+
+        self.advanced_button = ttk.Button(self.control_deck, text="高级设置 ▸", command=self.toggle_advanced)
+        self.advanced_button.pack(anchor='w', pady=(2, 3))
+        self.advanced_panel = ttk.Frame(self.control_deck, padding=(8, 4))
+        computing = ttk.Frame(self.advanced_panel)
+        computing.pack(fill='x')
+        ttk.Label(computing, text='声源上限 / 分摊音量').pack(side='left', padx=(0, 4))
+        ttk.Combobox(computing, textvariable=self.source_budget, values=list(range(1, MAX_SOURCE_BUDGET+1)),
+            state='readonly', width=4).pack(side='left')
+        ttk.Label(computing, text='空间聚合').pack(side='left', padx=(12, 4))
+        ttk.Combobox(computing, textvariable=self.aggregation_mode, values=['fixed', 'adaptive'],
+            state='readonly', width=9).pack(side='left')
+        ttk.Button(computing, text="导出诊断", command=self.export_diagnostics).pack(side='right')
+        self.activity_advanced = ttk.Frame(self.advanced_panel)
+        ttk.Label(self.activity_advanced, text='活动最大间隔/ns').pack(side='left', padx=(0, 4))
+        ttk.Entry(self.activity_advanced, textvariable=self.max_dt_ns, width=8).pack(side='left')
+        ttk.Button(self.activity_advanced, text='应用', command=self.apply_max_dt).pack(side='left', padx=5)
+        self.focus_check = ttk.Checkbutton(self.advanced_panel, text="关注区优先计算（实时活动）",
+            variable=self.focus_compute)
+
+        ttk.Label(shell, textvariable=self.data_note, style='Muted.TLabel', wraplength=1100).pack(anchor='w', pady=(2, 5))
         middle = ttk.Frame(shell)
         middle.pack(fill="both", expand=True)
-        self.canvas = tk.Canvas(middle, bg=PANEL, highlightthickness=0, width=690, height=370)
+        self.canvas = tk.Canvas(middle, bg=PANEL, highlightthickness=0, width=760, height=410)
         self.canvas.pack(side="left", fill="both", expand=True)
         self.canvas.bind("<Button-1>", self.move_roi)
         self.canvas.bind("<B1-Motion>", self.move_roi)
         controls = ttk.Frame(middle, padding=(20, 4, 0, 0), width=280)
         controls.pack(side="right", fill="y")
         ttk.Label(controls, text="关注区域 · 拖动画面移动").pack(anchor="w", pady=(0, 7))
-        ttk.Checkbutton(controls, text="关注区优先计算（实时活动）", variable=self.focus_compute).pack(anchor='w', pady=(0, 5))
-        for label, var, lo, hi in (("半径", self.radius, 0.1, 1.5), ("背景比例", self.background, 0, 1), ("总音量", self.master, 0, 0.6)):
+        for label, var, lo, hi in (("半径", self.radius, 0.1, 1.5), ("背景比例", self.background, 0, 1),
+                                   ("总音量", self.master, 0, 0.6)):
             ttk.Label(controls, text=label, style="Muted.TLabel").pack(anchor="w")
             ttk.Scale(controls, from_=lo, to=hi, variable=var, length=245).pack(fill="x", pady=(0, 9))
         ttk.Button(controls, text="关注区域回中", command=lambda: setattr(self, "center", (0.0, 0.0))).pack(fill="x", pady=4)
@@ -226,27 +270,135 @@ class SonicApp:
             button.pack(anchor="w", pady=3)
             self.sign_buttons.append(button)
         ttk.Label(controls, textvariable=self.legend, style="Muted.TLabel").pack(anchor="w", pady=6)
-        ttk.Label(shell, textvariable=self.summary, style="Muted.TLabel").pack(anchor="w", pady=(9, 5))
-        ttk.Label(shell, textvariable=self.selection_note, style="Muted.TLabel", wraplength=1040).pack(anchor="w", pady=(0, 5))
+
+        ttk.Label(shell, textvariable=self.summary, style="Muted.TLabel").pack(anchor="w", pady=(8, 4))
+        ttk.Label(shell, textvariable=self.selection_note, style="Muted.TLabel", wraplength=1100).pack(anchor="w", pady=(0, 4))
         columns = ("id", "sign", "xy", "strength", "gain", "angle", "selection")
-        self.table = ttk.Treeview(shell, columns=columns, show="headings", height=4, selectmode="none")
-        for key, label, width in zip(columns, ("声源", "符号", "位置 / µm", "原始强度", "目标增益", "角标签 / °", "范围 / 输出候选"), (160, 55, 155, 100, 100, 100, 160)):
+        self.table = ttk.Treeview(shell, columns=columns, show="headings", height=3, selectmode="none")
+        for key, label, width in zip(columns, ("声源", "符号", "位置 / µm", "原始强度", "目标增益", "角标签 / °", "范围 / 输出候选"),
+                                     (160, 55, 155, 100, 100, 100, 160)):
             self.table.heading(key, text=label)
             self.table.column(key, width=width, anchor="center")
         self.table.pack(fill="x")
-        audio_row = ttk.Frame(shell)
-        audio_row.pack(fill="x", pady=(12, 6))
-        self.device_combo = ttk.Combobox(audio_row, textvariable=self.device, values=["系统默认设备"], state="readonly", width=23)
+        audio_settings = ttk.Frame(shell)
+        audio_settings.pack(fill="x", pady=(8, 4))
+        ttk.Label(audio_settings, text="声音设备").pack(side="left", padx=(0, 5))
+        self.device_combo = ttk.Combobox(audio_settings, textvariable=self.device,
+            values=["系统默认设备"], state="readonly", width=23)
         self.device_combo.pack(side="left")
-        ttk.Checkbutton(audio_row, text="请求 HRTF", variable=self.hrtf).pack(side="left", padx=8)
-        self.audio_button = ttk.Button(audio_row, text="试听 / 重连", command=self.open_audio)
-        self.audio_button.pack(side="left")
-        ttk.Button(audio_row, text="静音", command=self.mute).pack(side="left", padx=6)
-        ttk.Button(audio_row, text="刷新设备", command=self.refresh_devices).pack(side="left")
-        ttk.Button(audio_row, text="加载场", command=self.load_field).pack(side="left", padx=4)
-        ttk.Button(audio_row, text="接入仿真", command=self.open_attachment).pack(side="left", padx=4)
-        ttk.Button(audio_row, text="导出诊断", command=self.export_diagnostics).pack(side="right")
-        ttk.Label(shell, textvariable=self.status, style="Muted.TLabel", wraplength=1040).pack(anchor="w")
+        ttk.Checkbutton(audio_settings, text="请求 HRTF", variable=self.hrtf).pack(side="left", padx=8)
+        ttk.Button(audio_settings, text="刷新设备", command=self.refresh_devices).pack(side="left")
+        ttk.Label(shell, textvariable=self.status, style="Muted.TLabel", wraplength=1100).pack(anchor="w")
+        self._sync_mode_controls()
+        self._sync_audio_control()
+
+    def try_demo(self):
+        """Load a no-GPU analytic example without opening an audio device."""
+        self.scenario.set(FIELD_SCENARIOS['field:skyrmion'])
+        self.reset()
+        self.status.set('已载入解析拓扑示例 · 点击“开启声音”后才会出声')
+
+    def toggle_audio(self):
+        if self.audio_ready or self.opening:
+            self.mute()
+        else:
+            self.open_audio()
+
+    def toggle_advanced(self):
+        visible = not self.advanced_visible.get()
+        self.advanced_visible.set(visible)
+        if visible:
+            self.advanced_panel.pack(fill='x', pady=(0, 4))
+        else:
+            self.advanced_panel.pack_forget()
+        self.advanced_button.configure(text='高级设置 ▾' if visible else '高级设置 ▸')
+
+    def change_recipe(self, event=None):
+        self.invalidate_field()
+        self._sync_mode_controls()
+
+    def _current_recipe(self):
+        scenario = self._labels.get(self.scenario.get(), '')
+        if scenario.startswith('field:band_'):
+            return 'band'
+        if scenario.startswith('field:activity_'):
+            return 'activity'
+        if scenario.startswith('field:wall_'):
+            return 'direction'
+        if scenario.startswith('field:'):
+            return 'topology'
+        if scenario in {'replay', 'live'}:
+            return {'活动': 'activity', '频带': 'band'}.get(self.replay_recipe.get(), 'topology')
+        return None
+
+    def _sync_mode_controls(self):
+        """Show only controls that are meaningful for the current source and recipe."""
+        scenario = self._labels.get(self.scenario.get(), '')
+        live = scenario == 'live'
+        selectable_recipe = live or scenario == 'replay'
+        recipe = self._current_recipe()
+        if live:
+            self.playback_controls.pack_forget()
+        elif not self.playback_controls.winfo_manager():
+            self.playback_controls.pack(fill='x', pady=(0, 3), before=self.advanced_button)
+        if selectable_recipe:
+            if not self.recipe_label.winfo_manager():
+                self.recipe_label.pack(side='left', padx=(14, 4), before=self.time_label_widget)
+                self.recipe_box.pack(side='left', before=self.time_label_widget)
+        else:
+            self.recipe_label.pack_forget()
+            self.recipe_box.pack_forget()
+        if recipe == 'band':
+            if not self.band_controls.winfo_manager():
+                self.band_controls.pack(fill='x', pady=(0, 3), before=self.advanced_button)
+        else:
+            self.band_controls.pack_forget()
+        if recipe == 'activity':
+            if not self.activity_advanced.winfo_manager():
+                self.activity_advanced.pack(fill='x', pady=(4, 0))
+        else:
+            self.activity_advanced.pack_forget()
+        if live and recipe == 'activity':
+            if not self.focus_check.winfo_manager():
+                self.focus_check.pack(anchor='w', pady=(4, 0))
+        else:
+            self.focus_check.pack_forget()
+
+    def _sync_audio_control(self):
+        if self.no_audio:
+            self.audio_state.set('音频：无声预览')
+            self.audio_button.configure(text='声音已禁用', state='disabled')
+        elif self.opening and not self._mute_requested:
+            self.audio_state.set('音频：正在开启')
+            self.audio_button.configure(text='静音', state='normal')
+        elif self.audio_ready:
+            self.audio_state.set('音频：已开启')
+            self.audio_button.configure(text='静音', state='normal')
+        else:
+            muted = self._mute_requested
+            self.audio_state.set('音频：已静音' if muted else '音频：未开启')
+            self.audio_button.configure(text='开启声音', state='disabled' if self.opening else 'normal')
+
+    def _sync_status_header(self):
+        scenario = self._labels.get(self.scenario.get(), '')
+        if scenario == 'live':
+            source = self._external_live_source
+            directory = getattr(source, 'directory', None)
+            identity = Path(directory).name if directory is not None else (
+                self.live_path.name if self.live_path is not None else '未命名数据源')
+            task = f'当前任务：实时 · {identity}'
+        elif scenario == 'replay':
+            identity = self.replay_path.name if self.replay_path is not None else '已载入数据'
+            task = f'当前任务：回放 · {identity}'
+        else:
+            task = f'当前任务：{self.scenario.get()}'
+        self.task_status.set(task)
+        if self.live_snapshot and scenario == 'live' and self.live_snapshot.get('state') == 'finished':
+            state = '已结束'
+        else:
+            state = {'valid': '有效', 'invalid': '无效', 'stale': '已过期',
+                     'warming_up': '等待／预热', 'unsupported': '不支持'}.get(self.sample.validity, self.sample.validity)
+        self.data_state.set(f'数据：{state} · 覆盖 {self.sample.coverage:.0%}')
 
     def refresh_devices(self):
         if self.no_audio or self.opening:
@@ -266,7 +418,8 @@ class SonicApp:
         self.opening = True
         self._mute_requested = False
         self.audio_ready = False
-        self.status.set("正在打开音频设备…")
+        self.status.set("正在开启声音…")
+        self._sync_audio_control()
         device_name = None if self.device.get() == "系统默认设备" else self.device.get()
         hrtf = self.hrtf.get()
 
@@ -291,11 +444,12 @@ class SonicApp:
         self.audio_ready = False
         if self.engine and not self.opening:
             self.engine.stop()
-        self.status.set("已静音 · 点击“开始试听 / 重连”恢复")
+        self.status.set("已静音 · 点击“开启声音”恢复")
+        self._sync_audio_control()
 
     def toggle_play(self):
         if self._labels[self.scenario.get()] == 'live':
-            self.status.set('实时跟随由发布端推进；可使用静音停止探听')
+            self.status.set('实时跟随由数据源推进；可使用顶部“静音”停止声音')
             return
         self.transport.playing = not self.transport.playing
         self._last_tick = time.monotonic()
@@ -389,6 +543,7 @@ class SonicApp:
         try:
             from ..sources.ovf_replay import load_field_replay
             self.replay = load_field_replay(path)
+            self.replay_path = Path(path)
             self._labels['回放 · 三分量场'] = 'replay'
             self.scenario_combo.configure(values=list(self._labels))
             self.scenario.set('回放 · 三分量场')
@@ -617,8 +772,9 @@ class SonicApp:
             self._open_result = None
             self.opening = False
             self.audio_ready = ok and not self._mute_requested
-            self.status.set(("已静音" if self._mute_requested else "音频已开启") if ok else f"无法开启音频：{error}")
+            self.status.set(("已静音" if self._mute_requested else "声音已开启") if ok else f"无法开启声音：{error}")
         scenario = self._labels[self.scenario.get()]
+        self._sync_mode_controls()
         if scenario == 'live':
             from dataclasses import replace
             from ..model import Sample
@@ -716,7 +872,7 @@ class SonicApp:
                     self._last_diag = now
             except Exception as exc:
                 self.audio_ready = False
-                self.status.set(f"音频故障：{exc} · 请重连")
+                self.status.set(f"音频故障：{exc} · 请点击“开启声音”重试")
         self.time_label.set(f"t = {self.transport.sim_time_s*1e9:.2f} ns · {self.transport.playback_rate:g}×")
         self.data_note.set('倍速只改变浏览速度；最大间隔只用于活动配方，留空不推断采样间隔。')
         positive = sum(o.strength for o in self.sample.observations if o.sign > 0)
@@ -776,6 +932,8 @@ class SonicApp:
                 f"{o.position_m[0]*1e6:.2f}, {o.position_m[1]*1e6:.2f}", f"{o.strength:.3g}",
                 f"{gains.get(o.source_id, 0):.4f}", f"{math.degrees(o.orientation_rad):.1f}",
                 ('圈内' if draw_attention.contains(o) else '圈外') + (' / 已选入' if gains.get(o.source_id, 0) > 0 else ' / 已选但输出静音' if o.source_id in self.selection_report['selected_ids'] else ' / 未选入')))
+        self._sync_status_header()
+        self._sync_audio_control()
         # Target a 33 ms start-to-start period rather than adding rendering
         # time to every cycle. Do not queue catch-up ticks after an overrun;
         # leave at least 5 ms for other Tk events and worker threads.
@@ -838,6 +996,7 @@ def run(no_audio=False, dll_path=None, field_demo=None, replay_path=None, recipe
     if replay_path:
         from ..sources.ovf_replay import load_field_replay
         app.replay = load_field_replay(replay_path)
+        app.replay_path = Path(replay_path)
         app._labels['回放 · 三分量场'] = 'replay'
         app.scenario_combo.configure(values=list(app._labels))
         app.scenario.set('回放 · 三分量场')

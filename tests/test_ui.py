@@ -397,3 +397,99 @@ def test_live_waiting_has_no_fake_zero_measurement(app):
     assert app.sample.source_kind == 'live'
     assert not app.scene.sources
     assert app.selection_report['validity'] == 'warming_up'
+
+
+
+def test_primary_entries_and_demo_remain_silent(app, monkeypatch):
+    calls = []
+    monkeypatch.setattr(app, 'open_attachment', lambda: calls.append('attach'))
+    monkeypatch.setattr(app, 'load_field', lambda: calls.append('replay'))
+    app.attach_entry.invoke()
+    app.replay_entry.invoke()
+    assert calls == ['attach', 'replay']
+
+    app.demo_entry.invoke()
+    assert app._labels[app.scenario.get()] == 'field:skyrmion'
+    assert not app.audio_ready and app.engine is None
+    assert '开启声音' in app.status.get()
+    app._tick()
+    assert '解析单纹理' in app.task_status.get()
+    assert '数据：有效' in app.data_state.get()
+    assert app.audio_state.get() == '音频：无声预览'
+
+
+def test_single_audio_control_toggles_on_and_off(app, monkeypatch):
+    app.no_audio = False
+    stopped = []
+    app.engine = SimpleNamespace(stop=lambda: stopped.append(True), close=lambda: None)
+    app.audio_ready = True
+    app._sync_audio_control()
+    assert app.audio_button.cget('text') == '静音'
+    app.audio_button.invoke()
+    assert stopped == [True]
+    assert not app.audio_ready and app._mute_requested
+    assert app.audio_state.get() == '音频：已静音'
+
+    opened = []
+    monkeypatch.setattr(app, 'open_audio', lambda: opened.append(True))
+    app.audio_button.invoke()
+    assert opened == [True]
+
+
+def test_live_and_recipe_modes_show_only_relevant_controls(app, monkeypatch):
+    from mumax_sonic.ui.app import FIELD_SCENARIOS
+
+    assert not app.band_controls.winfo_manager()
+    assert not app.recipe_box.winfo_manager()
+    app.scenario.set(FIELD_SCENARIOS['field:band_in'])
+    app.reset()
+    app._tick()
+    assert app.band_controls.winfo_manager() == 'pack'
+    assert app.playback_controls.winfo_manager() == 'pack'
+    assert not app.recipe_box.winfo_manager()  # fixed-demo recipe is not a false choice
+
+    app.follow_live('running.out/live.json')
+    state = dict(view=None, state='waiting', reason='waiting for frame', age_s=None,
+                 updates=0, last_error=None, processing_ms=None)
+    def poll():
+        app.live_snapshot = state
+        return state
+    monkeypatch.setattr(app, '_poll_live', poll)
+    app.replay_recipe.set('频带')
+    app._tick()
+    assert not app.playback_controls.winfo_manager()
+    assert app.band_controls.winfo_manager() == 'pack'
+    assert 'running.out' not in app.task_status.get()  # identity is the manifest name
+    assert 'live.json' in app.task_status.get()
+    assert '等待' in app.data_state.get()
+
+    app.replay_recipe.set('活动')
+    app._tick()
+    assert not app.band_controls.winfo_manager()
+    assert app.activity_advanced.winfo_manager() == 'pack'
+    assert app.focus_check.winfo_manager() == 'pack'
+    app.replay_recipe.set('拓扑')
+    app._tick()
+    assert not app.activity_advanced.winfo_manager()
+    assert not app.focus_check.winfo_manager()
+
+    assert not app.advanced_panel.winfo_manager()
+    app.advanced_button.invoke()
+    assert app.advanced_panel.winfo_manager() == 'pack'
+    app.advanced_button.invoke()
+    assert not app.advanced_panel.winfo_manager()
+
+
+def test_attached_task_identity_is_shown_separately_from_audio(app):
+    source = SimpleNamespace(
+        directory='/tmp/example-run.out',
+        config=SimpleNamespace(recipe='topology', stale_after_s=2.0),
+        snapshot=lambda: dict(view=None, state='waiting', reason='waiting', age_s=None,
+                              updates=0, last_error=None, processing_ms=None),
+        close=lambda: None,
+    )
+    app.attach_live_source(source)
+    app._tick()
+    assert 'example-run.out' in app.task_status.get()
+    assert app.data_state.get().startswith('数据：等待')
+    assert app.audio_state.get() == '音频：无声预览'
